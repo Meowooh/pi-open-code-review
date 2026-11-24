@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter, type AutocompleteItem } from "@earendil-works/pi-tui";
 
 const CONFIG_FILE = "open-code-review.json";
@@ -76,17 +76,17 @@ function fuzzyModels(models: Model<Api>[], query: string): Model<Api>[] {
 	return fuzzyFilter(models, query, (model) => `${modelKey(model)} ${model.name}`);
 }
 
-async function pickModel(ctx: ExtensionCommandContext, models: Model<Api>[]): Promise<Model<Api> | undefined> {
+async function pickModel(ctx: ExtensionContext, models: Model<Api>[], signal?: AbortSignal): Promise<Model<Api> | undefined> {
 	if (!models.length) throw new Error("No review models are available to pick.");
 	const keys = models.map(modelKey);
-	const choice = await ctx.ui.select("Select a review model", keys);
+	const choice = await ctx.ui.select("Select a review model", keys, { signal });
 	if (choice === undefined) return undefined;
 	const model = models[keys.indexOf(choice)];
 	if (!model) throw new Error("The review model picker returned an unknown choice.");
 	return model;
 }
 
-export async function selectReviewModel(ctx: ExtensionCommandContext, query: string | undefined): Promise<Model<Api> | undefined> {
+export async function selectReviewModel(ctx: ExtensionContext, query: string | undefined, signal?: AbortSignal, allowPicker = ctx.mode === "tui"): Promise<Model<Api> | undefined> {
 	let ref = query?.trim();
 	let config: ReviewConfig | undefined;
 	if (ref === undefined || ref.startsWith("@")) {
@@ -107,8 +107,8 @@ export async function selectReviewModel(ctx: ExtensionCommandContext, query: str
 		return model;
 	}
 	if (query === "") {
-		if (ctx.mode !== "tui") throw new Error("The review model picker requires TUI mode; specify --model <query>.");
-		return pickModel(ctx, candidates(ctx));
+		if (!allowPicker) throw new Error("The review model picker requires TUI mode; specify --model <query>.");
+		return pickModel(ctx, candidates(ctx), signal);
 	}
 
 	if (!ref) throw new Error("No review models match --model.");
@@ -121,14 +121,15 @@ export async function selectReviewModel(ctx: ExtensionCommandContext, query: str
 	const matches = exactIds.length ? exactIds : fuzzyModels(models, ref);
 	if (!matches.length) throw new Error("No review models match --model.");
 	if (matches.length === 1) return matches[0]!;
-	if (ctx.mode !== "tui") {
+	if (!allowPicker) {
 		throw new Error(`Ambiguous --model; specify one of: ${matches.map(modelKey).join(", ")}.`);
 	}
-	return pickModel(ctx, matches);
+	return pickModel(ctx, matches, signal);
 }
 
 export async function modelCompletions(ctx: ExtensionContext, prefix: string): Promise<AutocompleteItem[] | null> {
 	const args = prefix.trimStart();
+	if (args && !args.startsWith("-")) return null; // Free text belongs to the requesting agent, not the flag completer.
 	if (MODEL_FLAG.startsWith(args)) {
 		return [{ value: `${MODEL_FLAG} `, label: MODEL_FLAG, description: "Select a review model" }];
 	}

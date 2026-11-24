@@ -3,15 +3,11 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { devNull, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AFTER, BEFORE, BUG_LINE, COMMAND_ONLY, FINDING, MODELS, PATH, startFixtureProvider } from "./fixture-provider.mjs";
+import { AFTER, AGENT_CASE, BEFORE, BUG_LINE, FINDING, MODELS, PATH, startFixtureProvider } from "./fixture-provider.mjs";
 
 const extensionRoot = fileURLToPath(new URL("../", import.meta.url));
-const fixturePath = fileURLToPath(new URL("./fixture-provider.mjs", import.meta.url));
-const evidenceTools = ["file_read", "file_read_diff", "code_search", "file_find"];
 const fixtureTools = ["file_read", "code_comment", "task_done", "approve_all_comments"];
-const contract = "pricing-cases.md";
-const caseId = "SUBTOTAL-417";
-const usage = "Usage: node scripts/smoke.mjs [--live <author-provider/id> <review-provider/id>]";
+const usage = "Usage: npm run smoke";
 
 class SmokeError extends Error {}
 function expect(condition, message) {
@@ -64,15 +60,34 @@ const only = (xs, value) => Array.isArray(xs) && xs.length === 1 && xs[0] === va
 const countMap = (map) => map && typeof map === "object" && !Array.isArray(map)
   && Object.entries(map).every(([key, n]) => /^[a-z][a-z0-9_]{0,63}$/.test(key) && Number.isSafeInteger(n) && n > 0);
 
-function evidence(stdout, author, reviewer, exchanges) {
-  const reports = [];
-  for (const line of stdout.split("\n")) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = JSON.parse(line); } catch { throw new SmokeError("Pi stdout was not JSONL"); }
-    expect(event?.type !== "agent_start", "Pi ran an ordinary session-agent turn");
-    if (event?.type === "message_end" && event.message?.customType === "open-code-review") reports.push(event.message.details);
-  }
+function readEvents(stdout) {
+  return stdout.split("\n").filter((line) => line.trim()).map((line) => {
+    try { return JSON.parse(line); } catch { throw new SmokeError("Pi stdout was not JSONL"); }
+  });
+}
+
+const endMessages = (events) => events.filter((event) => event?.type === "message_end").map((event) => event.message);
+const fixtureModel = (model) => model.slice("fixture/".length);
+
+function fixtureEvidence(exchanges, reviewer) {
+  const models = [...new Set(exchanges.map((r) => r.model))];
+  const responses = exchanges.flatMap((r) => r.tool ? [r.tool] : []);
+  expect(only(models, fixtureModel(reviewer)), "Fixture server observed the wrong physical review model");
+  expect(fixtureTools.every((tool) => responses.includes(tool)),
+    "Fixture did not complete the native review and default filter rounds");
+  const verifiedFileRead = exchanges.some((r) => r.verifiedFileRead);
+  expect(verifiedFileRead && exchanges.some((r) => r.verifiedCodeComment),
+    "Fixture did not verify the native file_read and code_comment results");
+  return { requests: exchanges.length, models, responses, verifiedFileRead };
+}
+
+function directEvidence(stdout, author, reviewer, exchanges) {
+  const events = readEvents(stdout);
+  const messages = endMessages(events);
+  expect(!events.some((e) => ["agent_start", "turn_start", "tool_execution_start", "tool_execution_end"].includes(e?.type))
+    && !messages.some((m) => m?.role === "assistant" || m?.role === "toolResult"),
+    "Pi ran a session-agent turn or tool loop for a direct command");
+  const reports = messages.filter((m) => m?.customType === "open-code-review").map((m) => m.details);
   expect(reports.length === 1 && reports[0], "Expected one open-code-review message_end with details");
   const { status, selectedModel, sessionModelBefore, sessionModelAfter, coverage, comments, bridge } = reports[0];
   expect(selectedModel === reviewer, "Review selected the wrong model");
@@ -80,53 +95,90 @@ function evidence(stdout, author, reviewer, exchanges) {
   expect(status === "complete", "Native OCR status was not complete");
   expect(only(coverage?.selected, PATH) && only(coverage.completed, PATH), `Native OCR did not select and complete only ${PATH}`);
   const finding = Array.isArray(comments) && comments.find((c) => c?.path === PATH
-    && Number.isInteger(c.start_line) && c.start_line > 0 && c.start_line <= BUG_LINE
-    && Number.isInteger(c.end_line) && c.end_line >= BUG_LINE
-    && typeof c.content === "string" && c.content.trim()
-    && (!exchanges || (c.start_line === BUG_LINE && c.end_line === BUG_LINE && c.content.includes(FINDING))));
+    && c.start_line === BUG_LINE && c.end_line === BUG_LINE
+    && typeof c.content === "string" && c.content.includes(FINDING));
   expect(finding, `No OCR finding at ${PATH}:${BUG_LINE}`);
 
   expect(Number.isSafeInteger(bridge?.requests) && bridge.requests > 0 && only(bridge.answeredBy, reviewer),
     "Bridge did not report requests answered by the review model");
   const { requests, answeredBy, toolCalls, toolResults } = bridge;
   expect(countMap(toolCalls) && countMap(toolResults), "Bridge did not report native tool counters");
-  const roundtrips = evidenceTools.filter((tool) => toolCalls[tool] > 0 && toolResults[tool] > 0);
-  expect(roundtrips.length > 0, `No native evidence-tool roundtrip (observed calls: ${Object.keys(toolCalls).join(", ")}; results: ${Object.keys(toolResults).join(", ")})`);
-  if (!exchanges) {
-    expect(roundtrips.includes("file_read"), "Live model did not receive a native file_read result");
-    expect(finding.content.includes(caseId) || /\b822\b/.test(finding.content), "Finding did not cite evidence from the unchanged pricing case");
-  }
-  let fixture;
-  if (exchanges) {
-    const models = [...new Set(exchanges.map((r) => r.model))];
-    const responses = exchanges.flatMap((r) => r.tool ? [r.tool] : []);
-    expect(exchanges.length === requests && only(models, reviewer.slice("fixture/".length)),
-      "Fixture server observed a different physical model or request count");
-    expect(fixtureTools.every((tool) => responses.includes(tool) && toolCalls[tool] > 0),
-      "Fixture did not complete the native review and default filter rounds");
-    const verifiedFileRead = exchanges.some((r) => r.verifiedFileRead);
-    expect(verifiedFileRead && roundtrips.includes("file_read") && toolResults.code_comment > 0
-      && exchanges.some((r) => r.verifiedCodeComment), "Fixture did not verify the native file_read and code_comment results");
-    fixture = { requests: exchanges.length, models, responses, verifiedFileRead };
-  }
+  const fixture = fixtureEvidence(exchanges, reviewer);
+  expect(fixture.requests === requests, "Bridge and fixture disagree on the number of review requests");
+  expect(fixtureTools.every((tool) => toolCalls[tool] > 0), "Bridge did not observe all native review and filter tool calls");
+  expect(toolResults.file_read > 0 && toolResults.code_comment > 0,
+    "Bridge did not observe the native file_read and code_comment results");
   const { path, start_line, end_line } = finding;
   return { status, selectedModel, sessionModelBefore, sessionModelAfter,
-    coverage: { selected: coverage.selected, completed: coverage.completed }, finding: { path, start_line, end_line, ...(!exchanges && { content: finding.content.slice(0, 650) }) },
-    bridge: { requests, answeredBy, toolCalls, toolResults }, roundtrips, fixture };
+    coverage: { selected: coverage.selected, completed: coverage.completed }, finding: { path, start_line, end_line },
+    bridge: { requests, answeredBy, toolCalls, toolResults }, fixture };
 }
 
-async function review(label, author, reviewer, command, options, fixture) {
+function agentEvidence(stdout, author, reviewer, exchanges) {
+  const events = readEvents(stdout);
+  const messages = endMessages(events);
+  const eventType = (type) => events.filter((event) => event?.type === type);
+  expect(eventType("agent_start").length === 1 && eventType("agent_end").length === 1, "Expected one completed author agent loop");
+  // In JSON mode the command handler starts the turn with this entry. A raw slash-command fallthrough
+  // would have role "user" instead. Assert that the recorded message contains only user-authored text.
+  const inputs = messages.filter((m) => m?.role === "user" || m?.customType === "open-code-review-request");
+  expect(inputs.length === 1 && inputs[0].customType === "open-code-review-request"
+    && inputs[0].content === AGENT_CASE.command && inputs[0].display === true, "Incorrect visible review request");
+  expect(!messages.some((m) => m?.customType === "open-code-review"),
+    "Agent tool emitted a duplicate open-code-review completion message");
+
+  const turns = messages.filter((m) => m?.role === "assistant");
+  expect(turns.length === 2 && turns.every((m) => `${m.provider}/${m.model}` === author),
+    "Expected a tool call and a final reply from the author model");
+  const [firstTurn, finalTurn] = turns;
+  const calls = turns.flatMap((m) => m.content.filter((part) => part.type === "toolCall"));
+  const [call] = calls;
+  expect(calls.length === 1 && firstTurn.content.includes(call) && call.name === AGENT_CASE.tool,
+    "Expected exactly one author tool call to ocr_review");
+  const input = call.arguments;
+  expect(input?.model === AGENT_CASE.args.model && input.background === AGENT_CASE.args.background
+    && ["commit", "from", "to"].every((key) => !Object.hasOwn(input, key)),
+    "Author tool call did not use workspace scope, the expected model alias and background");
+  const results = messages.filter((m) => m?.role === "toolResult");
+  expect(results.length === 1 && results[0].toolCallId === call.id && results[0].toolName === call.name && results[0].isError === false,
+    "Expected exactly one successful result for the author tool call");
+  for (const type of ["tool_execution_start", "tool_execution_end"]) {
+    const executions = eventType(type);
+    expect(executions.length === 1 && executions[0].toolCallId === call.id && executions[0].toolName === call.name,
+      "Pi did not execute the author tool exactly once");
+  }
+  const finalText = finalTurn.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+  expect(finalTurn.stopReason === "stop" && finalText === AGENT_CASE.reply, "Author did not finish with the expected review summary");
+
+  const first = exchanges[0], last = exchanges.at(-1);
+  expect(first?.model === fixtureModel(author) && first.tool === AGENT_CASE.tool && first.verifiedIntent
+    && last?.model === fixtureModel(author) && last.verifiedReviewResult && !last.tool,
+    "Expected the author to see the intent, call the tool and receive the native report");
+  const reviewExchanges = exchanges.slice(1, -1);
+  const native = fixtureEvidence(reviewExchanges, reviewer);
+  expect(native.responses.length === fixtureTools.length, "Expected one set of native reviewer tool calls");
+  const verifiedBackground = reviewExchanges.some((r) => r.verifiedBackground);
+  expect(verifiedBackground, "Fixture did not verify the background in the native reviewer prompt");
+  return {
+    status: "complete",
+    author: { model: author, requests: 2, tool: call.name, toolCalls: calls.length, toolResults: results.length, finalText },
+    reviewer: { model: reviewer, ...native, verifiedBackground },
+    finding: { path: PATH, start_line: BUG_LINE, end_line: BUG_LINE },
+  };
+}
+
+async function review(label, author, reviewer, command, options, fixture, { agent = false } = {}) {
   const args = ["--offline", "--no-session", "--no-extensions", "--no-tools", "--no-context-files", "--no-skills",
     "--no-prompt-templates", "--no-approve", "-e", extensionRoot, "--mode", "json", "--model", author];
-  const live = !fixture;
-  if (live) args.push("-e", fixturePath, `--${COMMAND_ONLY}=true`, "--thinking", "low");
-  const offset = fixture?.requests.length;
-  const newRequests = () => fixture?.requests.slice(offset);
-  const fixtureError = () => newRequests()?.find((r) => r.error)?.error;
+  if (agent) args.push("--tools", AGENT_CASE.tool);
+  const offset = fixture.requests.length;
+  const newRequests = () => fixture.requests.slice(offset);
+  const fixtureError = () => newRequests().find((r) => r.error)?.error;
   try {
-    const stdout = await run("pi", [...args, command], options, live ? 360_000 : 60_000);
+    const stdout = await run("pi", [...args, command], options, 60_000);
     const error = fixtureError();
     expect(!error, error);
+    const evidence = agent ? agentEvidence : directEvidence;
     console.log(JSON.stringify({ run: label, ...evidence(stdout, author, reviewer, newRequests()) }));
   } catch (error) {
     const reason = fixtureError() ?? (error instanceof SmokeError ? error.message : "Unexpected review error");
@@ -136,82 +188,71 @@ async function review(label, author, reviewer, command, options, fixture) {
 
 async function main(args) {
   if (only(args, "--help") || only(args, "-h")) return console.log(usage);
-  const live = args[0] === "--live";
-  const qualified = /^[a-z0-9][a-z0-9_.-]*\/[a-z0-9][a-z0-9_.:/@+-]*$/i;
-  expect(!args.length || (live && args.length === 3 && args.slice(1).every((arg) => qualified.test(arg))), usage);
+  expect(args.length === 0, `Unexpected arguments. ${usage}`);
 
   const interrupt = new AbortController();
   const stop = () => interrupt.abort(new SmokeError("Interrupted"));
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  let root, fixture;
+  let root;
   try {
     root = await mkdtemp(join(await realpath(tmpdir()), "pi-ocr-smoke-"));
     const cwd = join(root, "repo"), home = join(root, "home"), agentDir = join(home, ".pi", "agent");
     await mkdir(cwd, { mode: 0o700 });
     await mkdir(agentDir, { recursive: true, mode: 0o700 });
-    const commonEnv = {
-      PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), TMPDIR: root,
-      GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_TERMINAL_PROMPT: "0",
-      OCR_NO_UPDATE: "1", OCR_ENABLE_TELEMETRY: "0", OCR_RAW_LOGGING: "0",
+    const clean = {
+      cwd, signal: interrupt.signal, env: {
+        PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter), TMPDIR: root,
+        GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_TERMINAL_PROMPT: "0",
+        OCR_NO_UPDATE: "1", OCR_ENABLE_TELEMETRY: "0", OCR_RAW_LOGGING: "0",
+        HOME: home, USERPROFILE: home,
+        XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
+        XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
+        PI_CODING_AGENT_DIR: agentDir, LC_ALL: "C",
+      },
     };
-    const clean = { cwd, signal: interrupt.signal, env: { ...commonEnv, HOME: home, USERPROFILE: home,
-      XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local", "share"),
-      XDG_CACHE_HOME: join(home, ".cache"), XDG_STATE_HOME: join(home, ".local", "state"),
-      PI_CODING_AGENT_DIR: agentDir, LC_ALL: "C" } };
     expect((await run("pi", ["--offline", "--version"], clean)).trim() === "1.6.0", "Expected installed Pi 1.6.0");
     expect(/^open-code-review v1\.14\.2(?:\s|$)/.test(await run("ocr", ["--version"], clean)), "Expected installed OCR v1.14.2");
     const git = (...args) => run("git", args, clean);
     await git("init", "-q", "--template=", "-b", "main");
     await writeFile(join(cwd, PATH), BEFORE);
     await git("add", "--", PATH);
-    if (live) {
-      // OCR initially shows the entire diff. Give this smoke test an actual reason
-      // to read unchanged context; do not alter the extension or its prompts.
-      await writeFile(join(cwd, contract), `# Accepted pricing cases\n\n${caseId}: If a unit costs 137 cents and six units are ordered, the subtotal must be 822 cents.\n`);
-      await mkdir(join(cwd, ".opencodereview"));
-      await writeFile(join(cwd, ".opencodereview/rule.json"), JSON.stringify({ rules: [{
-        path: PATH, merge_system_rule: true,
-        rule: `For a subtotal change you must use file_read to look up the approved example in ${contract} before deciding whether this change is correct. If the new implementation violates the example, include its case ID, actual result and expected result in your finding.`,
-      }] }));
-      await git("add", "--", contract, ".opencodereview/rule.json");
-    }
     await git("-c", "user.name=OCR Smoke", "-c", "user.email=ocr-smoke@example.invalid",
       "commit", "-q", "--no-gpg-sign", "-m", "Seed pricing fixture");
     await writeFile(join(cwd, PATH), AFTER);
     expect(await git("status", "--porcelain") === ` M ${PATH}\n`, "Fixture is not a single unstaged change");
 
-    if (live) {
-      const [, author, reviewer] = args;
-      expect(author !== reviewer, "Use different author and review model IDs to verify the override");
-      const env = { ...process.env, ...commonEnv };
-      for (const key of Object.keys(process.env)) {
-        if (/^(?:GIT_|OCR_)/.test(key) && !Object.hasOwn(commonEnv, key)) delete env[key];
-      }
-      await review("live", author, reviewer, `/open-code-review --model ${reviewer}`, { ...clean, env });
-    } else {
-      fixture = await startFixtureProvider();
-      const writeConfig = (name, value) => writeFile(join(agentDir, name), JSON.stringify(value), { mode: 0o600 });
-      const [author, reviewer] = MODELS.map((id) => `fixture/${id}`);
-      await writeConfig("models.json", { providers: { fixture: {
-        baseUrl: fixture.baseUrl, apiKey: fixture.apiKey, api: "openai-completions", models: MODELS.map((id) => ({ id })),
-      } } });
-      await writeConfig("open-code-review.json", { defaultModel: "current", aliases: { review: reviewer } });
-      // An existing OCR provider wins over OCR_LLM_* if the child HOME leaks.
-      const ocrDir = join(home, ".opencodereview");
-      await mkdir(ocrDir, { recursive: true });
-      const oldConfig = JSON.stringify({ provider: "openai", providers: { openai: {
-        url: "http://127.0.0.1:1/v1", api_key: "fixture-only", model: "must-not-be-used",
-      } } });
-      const oldPath = join(ocrDir, "config.json");
-      await writeFile(oldPath, oldConfig, { mode: 0o600 });
-      await review("default", author, author, "/open-code-review", clean, fixture);
-      await review("alias", author, reviewer, "/open-code-review --model @review", clean, fixture);
-      expect(await readFile(oldPath, "utf8") === oldConfig, "Existing OCR provider config was changed");
-    }
+    const writeConfig = (name, value) => writeFile(join(agentDir, name), JSON.stringify(value), { mode: 0o600 });
+    const withFixture = async (config, action) => {
+      const fixture = await startFixtureProvider(config);
+      try {
+        await writeConfig("models.json", { providers: { fixture: {
+          baseUrl: fixture.baseUrl, apiKey: fixture.apiKey, api: "openai-completions", models: MODELS.map((id) => ({ id })),
+        } } });
+        await action(fixture);
+      } finally { await fixture.close(); }
+    };
+    const [author, reviewer] = MODELS.map((id) => `fixture/${id}`);
+    await writeConfig("open-code-review.json", { defaultModel: "current", aliases: { review: reviewer } });
+    // An existing OCR provider wins over OCR_LLM_* if the child HOME leaks.
+    const ocrDir = join(home, ".opencodereview");
+    await mkdir(ocrDir, { recursive: true });
+    const oldConfig = JSON.stringify({ provider: "openai", providers: { openai: {
+      url: "http://127.0.0.1:1/v1", api_key: "fixture-only", model: "must-not-be-used",
+    } } });
+    const oldPath = join(ocrDir, "config.json");
+    await writeFile(oldPath, oldConfig, { mode: 0o600 });
+    await withFixture({}, async (fixture) => {
+      await review("default", author, author, "/ocr-review", clean, fixture);
+      await review("alias", author, reviewer, "/ocr-review --model @review", clean, fixture);
+    });
+    // Keep author tool history and model activity separate from the direct review cases.
+    await withFixture({ agent: true }, (fixture) =>
+      review("agent-tool", author, reviewer, AGENT_CASE.command, clean, fixture, { agent: true }));
+    expect(await readFile(oldPath, "utf8") === oldConfig, "Existing OCR provider config was changed");
   } finally {
     try {
-      try { await fixture?.close(); } finally { if (root) await rm(root, { recursive: true, force: true }); }
+      if (root) await rm(root, { recursive: true, force: true });
     } finally {
       process.off("SIGINT", stop);
       process.off("SIGTERM", stop);

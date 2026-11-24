@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
-import { parseArgs } from "../src/extension.ts";
 import { createPiChat } from "../src/pi-chat.ts";
 import { listenForOcr, childEnvironment } from "../src/ocr.ts";
+import type { ReviewProgress } from "../src/review-task.ts";
 
 const model: Model<"openai-codex-responses"> = { api: "openai-codex-responses", id: "reviewer", provider: "fixture", name: "Reviewer", baseUrl: "https://invalid.example", reasoning: true, input: ["text"], contextWindow: 8192, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 const answer: AssistantMessage = { role: "assistant", api: model.api, model: model.id, provider: model.provider, timestamp: 0, stopReason: "toolUse", usage: { ...model.cost, totalTokens: 0, cost: { ...model.cost, total: 0 } }, content: [
@@ -42,6 +42,35 @@ test("round trip: OCR owns tools; preserve Pi-native IDs and signed history with
   assert.deepEqual(chat.stats.answeredBy, [chat.id]);
 });
 
+test("count only acknowledged code_comment batches, once per wire ID; don't expose private fields or guess locations", async () => {
+  const updates: ReviewProgress[] = [];
+  const stream = () => {
+    const s = createAssistantMessageEventStream();
+    s.end({ ...answer, content: [{ type: "toolCall", id: "native_id", name: "code_comment", arguments: { comments: [
+      { path: "a.ts", content: "Fix total.", start_line: 999, thinking: "private reasoning", suggestion_code: "multiply()" },
+      { path: "b.ts", content: "Fix tax." }, { content: "Missing location" },
+    ] } }] });
+    return s;
+  };
+  const chat = createPiChat({ streamSimple: stream }, model).withProgress(u => updates.push(u));
+  const signal = new AbortController().signal;
+  const first = await chat.complete({ model: chat.id, messages: prompt }, signal);
+  assert.ok(updates.some(u => u.activity === "Submitting findings"));
+  assert.ok(!updates.some(u => u.candidates));
+  const resultOf = (answer: typeof first, content: string) => {
+    const wire = answer.choices[0].message;
+    return chat.complete({ model: chat.id, messages: [...prompt, wire, { role: "tool", tool_call_id: wire.tool_calls![0].id, content }] }, signal);
+  };
+  const second = await resultOf(first, "Error: no comments filed");
+  assert.ok(!updates.some(u => u.candidates));
+  await resultOf(second, "Successfully commented."); await resultOf(second, "Successfully commented.");
+  const batches = updates.flatMap(u => u.candidates ? [u.candidates] : []);
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0].map(c => [c.path, c.start_line]), [["a.ts", 0], ["b.ts", 0]]);
+  assert.equal(batches[0][0].suggestion_code, "multiply()");
+  assert.doesNotMatch(JSON.stringify(batches), /private reasoning|999/);
+});
+
 test("the local bridge rejects foreign clients, routes and models without contacting a provider", async () => {
   const chat = createPiChat({ streamSimple: () => { throw new Error("unexpected provider request"); } }, model);
   const bridge = await listenForOcr(chat, new AbortController().signal);
@@ -62,12 +91,4 @@ test("the child gets only run-local credentials and its own home", () => {
   assert.equal(env.OCR_LLM_TOKEN, "once");
   assert.equal(env.OCR_LLM_PROTOCOL, "openai");
   for (const key of ["OPENAI_API_KEY", "PI_CODING_AGENT_DIR", "OCR_LLM_EXTRA_HEADERS", "OTEL_EXPORTER_OTLP_ENDPOINT", "GITHUB_TOKEN", "HTTP_PROXY", "NODE_OPTIONS"]) assert.equal(key in env, false);
-});
-
-test("only explicit review scope flags reach OCR", () => {
-  assert.deepEqual(parseArgs("--model alpha beta --from main --to topic"), { model: "alpha beta", target: ["--from", "main", "--to", "topic"], preview: false });
-  assert.deepEqual(parseArgs("--preview"), { model: undefined, target: [], preview: true });
-  assert.equal(parseArgs("--model").model, "");
-  assert.equal(parseArgs("--model=@review").model, "@review");
-  for (const s of ["--provider other", "--commit --model", "--to branch", "--from main --commit HEAD", "--model a --model b"]) assert.throws(() => parseArgs(s));
 });

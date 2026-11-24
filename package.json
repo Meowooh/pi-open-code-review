@@ -1,12 +1,31 @@
 {
-  "name": "pi-open-code-review",
-  "version": "0.0.0",
-  "private": true,
+  "name": "pi-native-open-code-review",
+  "version": "0.2.6",
   "type": "module",
-  "description": "Feasibility spike: native OpenCodeReview using a pi 1.6.0 model",
+  "description": "Review Git changes with Alibaba OpenCodeReview and your pi model. Read line-level findings in the conversation or review them in a TUI panel.",
+  "license": "MIT",
+  "author": "Meowooh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Meowooh/pi-open-code-review.git"
+  },
+  "homepage": "https://github.com/Meowooh/pi-open-code-review#readme",
+  "bugs": {
+    "url": "https://github.com/Meowooh/pi-open-code-review/issues"
+  },
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "open-code-review",
+    "code-review"
   ],
+  "files": [
+    "src/**/*.ts"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "pi": {
     "extensions": [
       "./src/extension.ts"
@@ -23,13 +42,15 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.6.0",
     "@earendil-works/pi-coding-agent": "1.6.0",
     "@earendil-works/pi-tui": "1.6.0",
     "@types/node": "22.18.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "typebox": "1.3.27"
   }
 }
